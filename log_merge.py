@@ -39,14 +39,18 @@ def get_qso_time(rec):
 class AdifParser:
     """
     流式 ADIF 解析器，避免一次性读取大文件导致内存溢出。
+    【修复说明】
+    改为二进制模式处理。ADIF 的长度标签是字节长度，文本模式读取多字节字符（中文）
+    会导致长度计算错误，进而引发乱码和解析错位。
     """
     def __init__(self, file_path):
         self.file_path = file_path
         self.file_name = os.path.basename(file_path)
-        self.tag_pattern = re.compile(r'<([^:>]+):(\d+)(?::[^>]+)?>', re.IGNORECASE)
+        # 正则表达式改为 bytes 类型，匹配二进制数据
+        self.tag_pattern = re.compile(rb'<([^:>]+):(\d+)(?::[^>]+)?>', re.IGNORECASE)
 
     def _parse_single_record(self, raw_data):
-        """解析单条 ADIF 文本为字典"""
+        """解析单条 ADIF 字节流为字典"""
         if not raw_data.strip():
             return None
             
@@ -62,8 +66,9 @@ class AdifParser:
             tag_match = self.tag_pattern.search(raw_data, pos)
             if not tag_match:
                 break
-                
-            tag_name = tag_match.group(1).upper()
+            
+            # 标签名是 ASCII，直接解码
+            tag_name = tag_match.group(1).decode('ascii', errors='ignore').upper()
             value_len = int(tag_match.group(2))
             
             # 数据值的起始位置
@@ -72,8 +77,19 @@ class AdifParser:
             
             # 提取值
             if value_end <= data_len:
-                value = raw_data[value_start:value_end]
-                record_data[tag_name] = value
+                value_bytes = raw_data[value_start:value_end]
+                
+                # 【关键修复】智能解码
+                # 优先尝试 UTF-8，失败则尝试 GB18030 (覆盖 GBK/GB2312)
+                try:
+                    value_str = value_bytes.decode('utf-8')
+                except UnicodeDecodeError:
+                    try:
+                        value_str = value_bytes.decode('gb18030')
+                    except UnicodeDecodeError:
+                        value_str = value_bytes.decode('utf-8', errors='replace')
+
+                record_data[tag_name] = value_str
                 pos = value_end
             else:
                 # 异常情况：长度超出剩余字符串
@@ -87,12 +103,14 @@ class AdifParser:
         """
         生成器：逐条读取并返回记录。
         使用缓冲区处理跨块的记录。
+        【修复】使用二进制读取，避免编码导致的偏移问题。
         """
-        buffer = ""
+        buffer = b""  # 使用字节缓冲
         chunk_size = 1024 * 1024 * 2  # 2MB chunks
         
         try:
-            with open(self.file_path, 'r', encoding='utf-8', errors='ignore') as f:
+            # 以 'rb' (二进制) 读取，不做任何编码转换
+            with open(self.file_path, 'rb') as f:
                 # 尝试跳过 Header，找到第一个 <EOH>
                 header_found = False
                 
@@ -104,30 +122,28 @@ class AdifParser:
                     buffer += chunk
                     
                     if not header_found:
-                        # 查找 header 结束符 (忽略大小写)
-                        # 使用正则不仅慢，而且处理分块麻烦，这里简单处理
+                        # 查找 header 结束符 (二进制查找)
                         lower_buf = buffer.lower()
-                        eoh_idx = lower_buf.find('<eoh>')
+                        eoh_idx = lower_buf.find(b'<eoh>')
                         if eoh_idx != -1:
                             buffer = buffer[eoh_idx+5:] # 跳过 <EOH>
                             header_found = True
                         else:
-                            # 如果 buffer 太大还没找到 header，可能是纯记录文件或异常，保留 buffer 继续读
-                            if len(buffer) > 10 * 1024 * 1024: # 10MB header? 不太可能
+                            # 如果 buffer 太大还没找到 header，可能是纯记录文件或异常
+                            if len(buffer) > 10 * 1024 * 1024: 
                                 header_found = True # 强制开始解析
                             continue
 
                     # 处理记录分隔符 <EOR>
                     while True:
                         # 查找 <EOR> 的位置
-                        # 注意：buffer 可能包含半个 <EOR>，例如 "...<EO"
                         lower_buf = buffer.lower()
-                        eor_idx = lower_buf.find('<eor>')
+                        eor_idx = lower_buf.find(b'<eor>')
                         
                         if eor_idx == -1:
                             break
                         
-                        # 提取一条完整的原始记录记录
+                        # 提取一条完整的原始记录 (bytes)
                         raw_rec = buffer[:eor_idx]
                         # 移动 buffer 指针
                         buffer = buffer[eor_idx+5:]
@@ -220,7 +236,11 @@ def write_adif_file(file_path, records):
     )
     
     try:
-        with open(file_path, 'w', encoding='utf-8') as f:
+        # 【修复】使用 gb18030 编码写入，以兼容常见的中文日志软件（如 N1MM 等默认非 UTF-8 环境）
+        # 如果使用 utf-8，很多软件打开会显示乱码
+        out_encoding = 'gb18030'
+        
+        with open(file_path, 'w', encoding=out_encoding) as f:
             f.write(header)
             for rec in records:
                 line = ""
@@ -228,7 +248,9 @@ def write_adif_file(file_path, records):
                     if tag.startswith('_'): continue 
                     # 确保 val 是字符串
                     val_str = str(val)
-                    line += f"<{tag}:{len(val_str.encode('utf-8'))}>{val_str} "
+                    # 【修复】计算字节长度时必须使用与文件写入相同的编码
+                    # ADIF 要求长度为字节长度，UTF-8 和 GB18030 的中文字节长度不同（3字节 vs 2字节等）
+                    line += f"<{tag}:{len(val_str.encode(out_encoding))}>{val_str} "
                 f.write(line + "<EOR>\r\n")
     except Exception as e:
         print(f"写入文件 {file_path} 失败: {e}")
