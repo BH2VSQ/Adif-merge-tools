@@ -168,17 +168,18 @@ class FastDeduplicator:
     使用哈希索引代替线性遍历，大幅提升大数据量下的速度。
     """
     def __init__(self):
-        # 最终输出的记录列表： Key=Station_Callsign, Value=[Records]
+        # 最终输出的记录列表： Key=GroupKey (Call-Grid), Value=[Records]
         self.final_records = defaultdict(list)
         
-        # 索引用于快速查找： Key=Station_Callsign -> { (DX_Call, Band, Mode) -> [(TimeObj, Record)] }
+        # 索引用于快速查找： Key=GroupKey -> { (DX_Call, Band, Mode) -> [(TimeObj, Record)] }
         self.lookup_index = defaultdict(lambda: defaultdict(list))
         
         self.dupe_details = []
 
-    def process_record(self, record, station_call):
+    def process_record(self, record, group_key):
         """
         处理单条记录：判断重复，如果非重复则添加。
+        group_key: 用于分组的唯一标识（如 "BI4KVO-PM01"）
         """
         # 1. 提取关键比对字段
         dx_call = record.get('CALL', '').upper()
@@ -188,13 +189,15 @@ class FastDeduplicator:
         
         if not dx_call or not qso_time:
             # 缺少关键信息的记录，直接视为新记录添加，不参与严格去重
-            self._add_to_storage(station_call, record, dx_call, band, mode, qso_time)
+            self._add_to_storage(group_key, record, dx_call, band, mode, qso_time)
             return
 
         # 2. 快速查重
         # 只有相同 (DX_Call, Band, Mode) 的记录才值得比对时间
+        # 注意：这里是在同一个 group_key (即同一个 呼号-网格) 内部查重
+        # 不同网格的记录天然被视为不重复
         key = (dx_call, band, mode)
-        candidates = self.lookup_index[station_call][key]
+        candidates = self.lookup_index[group_key][key]
         
         is_dupe = False
         existing_rec = None
@@ -209,27 +212,27 @@ class FastDeduplicator:
         
         if is_dupe:
             self.dupe_details.append({
-                'station': station_call,
+                'station': group_key,
                 'new_rec': record,
                 'old_rec': existing_rec
             })
         else:
-            self._add_to_storage(station_call, record, dx_call, band, mode, qso_time)
+            self._add_to_storage(group_key, record, dx_call, band, mode, qso_time)
 
-    def _add_to_storage(self, station_call, record, dx_call, band, mode, qso_time):
+    def _add_to_storage(self, group_key, record, dx_call, band, mode, qso_time):
         """将记录加入存储和索引"""
-        self.final_records[station_call].append(record)
+        self.final_records[group_key].append(record)
         
         # 只有具备完整信息的才加入索引供后续比对
         if dx_call and qso_time:
             key = (dx_call, band, mode)
             # 存储 (Time, Record) 元组
-            self.lookup_index[station_call][key].append((qso_time, record))
+            self.lookup_index[group_key][key].append((qso_time, record))
 
 def write_adif_file(file_path, records):
     """写入 ADIF 文件"""
     header = (
-        "ADIF Export from Python Tool (Optimized)\r\n"
+        "ADIF Export from Python Tool (Splitted by Call-Grid)\r\n"
         "Created by Gemini\r\n"
         "<ADIF_VER:5>3.1.4\r\n"
         "<EOH>\r\n"
@@ -237,7 +240,6 @@ def write_adif_file(file_path, records):
     
     try:
         # 【修复】使用 gb18030 编码写入，以兼容常见的中文日志软件（如 N1MM 等默认非 UTF-8 环境）
-        # 如果使用 utf-8，很多软件打开会显示乱码
         out_encoding = 'gb18030'
         
         with open(file_path, 'w', encoding=out_encoding) as f:
@@ -249,14 +251,13 @@ def write_adif_file(file_path, records):
                     # 确保 val 是字符串
                     val_str = str(val)
                     # 【修复】计算字节长度时必须使用与文件写入相同的编码
-                    # ADIF 要求长度为字节长度，UTF-8 和 GB18030 的中文字节长度不同（3字节 vs 2字节等）
                     line += f"<{tag}:{len(val_str.encode(out_encoding))}>{val_str} "
                 f.write(line + "<EOR>\r\n")
     except Exception as e:
         print(f"写入文件 {file_path} 失败: {e}")
 
 def generate_html_report(report_path, dupe_details):
-    """生成 HTML 报告 (保持原逻辑，优化大数据下的展示可能需要分页，但此处暂保持简单)"""
+    """生成 HTML 报告"""
     if not dupe_details:
         return
 
@@ -298,7 +299,7 @@ def generate_html_report(report_path, dupe_details):
             <thead>
                 <tr>
                     <th>序号</th>
-                    <th>所属电台呼号</th>
+                    <th>电台呼号-网格</th>
                     <th>比对详情 (重复项 vs 原始项)</th>
                 </tr>
             </thead>
@@ -313,7 +314,7 @@ def generate_html_report(report_path, dupe_details):
             if not r: return "无法读取记录"
             return f"<span class='tag'>CALL:</span> <span class='val'>{r.get('CALL','')}</span> | " \
                    f"<span class='tag'>BAND:</span> <span class='val'>{r.get('BAND','')}</span> | " \
-                   f"<span class='tag'>MODE:</span> <span class='val'>{r.get('MODE','')}</span><br>" \
+                   f"<span class='tag'>GRID:</span> <span class='val'>{r.get('MY_GRIDSQUARE','')}</span><br>" \
                    f"<span class='tag'>TIME:</span> <span class='val'>{r.get('QSO_DATE','')} {r.get('TIME_ON','')}</span>"
 
         html_content += f"""
@@ -375,7 +376,7 @@ def process_adi_files():
         input("按回车键退出...")
         return
 
-    print(f"找到 {len(all_target_files)} 个文件。开始分析...")
+    print(f"找到 {len(all_target_files)} 个文件。开始分析 (按 呼号-网格 拆分)...")
     print("-" * 50)
 
     # 3. 处理文件
@@ -394,27 +395,46 @@ def process_adi_files():
         for rec in parser.stream_records():
             rec_count += 1
             
+            # --- 核心修改逻辑开始 ---
+            
             raw_callsign = rec.get('STATION_CALLSIGN')
+            raw_grid = rec.get('MY_GRIDSQUARE') # 获取网格
+
+            # 处理呼号部分
             if not raw_callsign or not raw_callsign.strip():
-                call_key = 'UNKNOWN'
+                call_part = 'UNKNOWN'
+                # 记录缺失呼号的条数
                 unknown_sources[file_path_rel] += 1
             else:
-                call_key = raw_callsign.strip().replace('/', '_')
+                call_part = raw_callsign.strip().upper().replace('/', '_')
             
-            # 交给去重器处理
-            deduplicator.process_record(rec, call_key)
+            # 处理网格部分
+            if raw_grid and raw_grid.strip():
+                grid_part = raw_grid.strip().upper()
+                # 简单清洗网格字符，防止特殊字符导致文件名错误 (保留数字和字母)
+                grid_part = "".join([c for c in grid_part if c.isalnum()])
+                # 组合键名：呼号-网格
+                group_key = f"{call_part}-{grid_part}"
+            else:
+                # 缺失网格时的命名
+                group_key = f"{call_part}-NOGRID"
+            
+            # --- 核心修改逻辑结束 ---
+            
+            # 交给去重器处理 (以 group_key 为单位进行归类和查重)
+            deduplicator.process_record(rec, group_key)
             total_qso_count += 1
             
-            # 实时进度条 (每处理 200 条刷新一次显示，使用 \r 回车符覆盖当前行)
+            # 实时进度条
             if total_qso_count % 200 == 0:
                 sys.stdout.write(f"\r    └── 进度: 当前文件已读 {rec_count} 条 | 总计处理 {total_qso_count} 条")
                 sys.stdout.flush()
 
-        # 单个文件处理完毕，显示最终行并换行
+        # 单个文件处理完毕
         sys.stdout.write(f"\r    └── 完成: 当前文件已读 {rec_count} 条 | 总计处理 {total_qso_count} 条     \n")
         sys.stdout.flush()
         
-        # 强制垃圾回收，释放读取大文件产生的临时内存
+        # 强制垃圾回收
         gc.collect()
 
     print("-" * 50)
@@ -422,11 +442,12 @@ def process_adi_files():
 
     # 4. 导出文件
     exported_files = 0
-    for callsign, recs in deduplicator.final_records.items():
+    for file_key, recs in deduplicator.final_records.items():
         if not recs: continue
-        output_file = os.path.join(output_dir, f"{callsign}.adi")
+        # 文件名直接使用组合好的 Key (Call-Grid.adi)
+        output_file = os.path.join(output_dir, f"{file_key}.adi")
         write_adif_file(output_file, recs)
-        print(f" -> 生成: {callsign}.adi ({len(recs)} 条唯一 QSO)")
+        print(f" -> 生成: {file_key}.adi ({len(recs)} 条 QSO)")
         exported_files += 1
 
     # 5. 生成报告
@@ -452,7 +473,7 @@ def process_adi_files():
     # 总结
     if unknown_sources:
         print("\n" + "!"*30)
-        print("警告: 以下文件包含缺失 STATION_CALLSIGN 的记录，已归类为 UNKNOWN.adi")
+        print("警告: 以下文件包含缺失 STATION_CALLSIGN 的记录")
         for source_file, count in unknown_sources.items():
             print(f" - {source_file}: {count} 条")
         print("!"*30)
